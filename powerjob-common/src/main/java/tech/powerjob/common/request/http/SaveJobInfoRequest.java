@@ -4,6 +4,10 @@ import tech.powerjob.common.enums.DispatchStrategy;
 import tech.powerjob.common.enums.ExecuteType;
 import tech.powerjob.common.enums.ProcessorType;
 import tech.powerjob.common.enums.TimeExpressionType;
+import tech.powerjob.common.model.AlarmConfig;
+import tech.powerjob.common.model.JobAdvancedRuntimeConfig;
+import tech.powerjob.common.model.LogConfig;
+import tech.powerjob.common.model.LifeCycle;
 import tech.powerjob.common.utils.CommonUtils;
 import lombok.Data;
 import tech.powerjob.common.response.JobInfoDTO;
@@ -25,6 +29,10 @@ public class SaveJobInfoRequest {
     private Long id;
     /* ************************** Base info of related job. ************************** */
 
+    /**
+     * 目录id
+     */
+    private Long catalogId;
     /**
      * Name of the job.
      */
@@ -131,8 +139,31 @@ public class SaveJobInfoRequest {
 
     private DispatchStrategy dispatchStrategy;
 
-    private String lifecycle;
+    /**
+     * 某种派发策略背后的具体配置，值取决于 dispatchStrategy
+     */
+    private String dispatchStrategyConfig;
 
+    private LifeCycle lifeCycle;
+    /**
+     * alarm config
+     */
+    private AlarmConfig alarmConfig;
+
+    /**
+     * 任务归类，开放给接入方自由定制
+     */
+    private String tag;
+
+    /**
+     * 日志配置，包括日志级别、日志方式等配置信息
+     */
+    private LogConfig logConfig;
+
+    /**
+     * 高级运行时配置
+     */
+    private JobAdvancedRuntimeConfig advancedRuntimeConfig;
 
     /**
      * Check non-null properties.

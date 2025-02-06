@@ -1,16 +1,20 @@
 package tech.powerjob.server.web.controller;
 
+import tech.powerjob.common.OmsConstant;
 import tech.powerjob.common.enums.InstanceStatus;
 import tech.powerjob.common.response.ResultDTO;
+import tech.powerjob.server.auth.Permission;
+import tech.powerjob.server.auth.RoleScope;
+import tech.powerjob.server.auth.interceptor.ApiPermission;
 import tech.powerjob.server.common.utils.OmsFileUtils;
 import tech.powerjob.server.persistence.PageResult;
 import tech.powerjob.server.persistence.StringPage;
 import tech.powerjob.server.persistence.remote.model.InstanceInfoDO;
-import tech.powerjob.server.persistence.remote.repository.AppInfoRepository;
 import tech.powerjob.server.persistence.remote.repository.InstanceInfoRepository;
 import tech.powerjob.server.core.service.CacheService;
 import tech.powerjob.server.core.instance.InstanceLogService;
 import tech.powerjob.server.core.instance.InstanceService;
+import tech.powerjob.server.web.request.QueryInstanceDetailRequest;
 import tech.powerjob.server.web.request.QueryInstanceRequest;
 import tech.powerjob.server.web.response.InstanceDetailVO;
 import tech.powerjob.server.web.response.InstanceInfoVO;
@@ -22,7 +26,7 @@ import org.springframework.data.domain.Example;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
-import org.springframework.util.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
@@ -30,6 +34,7 @@ import javax.servlet.http.HttpServletResponse;
 import java.io.File;
 import java.net.URL;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 
@@ -44,8 +49,6 @@ import java.util.stream.Collectors;
 @RequestMapping("/instance")
 public class InstanceController {
 
-
-
     @Resource
     private InstanceService instanceService;
     @Resource
@@ -54,33 +57,57 @@ public class InstanceController {
     @Resource
     private CacheService cacheService;
     @Resource
-    private AppInfoRepository appInfoRepository;
-    @Resource
     private InstanceInfoRepository instanceInfoRepository;
 
     @GetMapping("/stop")
+    @ApiPermission(name = "Instance-Stop", roleScope = RoleScope.APP, requiredPermission = Permission.OPS)
     public ResultDTO<Void> stopInstance(Long appId,Long instanceId) {
         instanceService.stopInstance(appId,instanceId);
         return ResultDTO.success(null);
     }
 
     @GetMapping("/retry")
+    @ApiPermission(name = "Instance-Retry", roleScope = RoleScope.APP, requiredPermission = Permission.OPS)
     public ResultDTO<Void> retryInstance(String appId, Long instanceId) {
         instanceService.retryInstance(Long.valueOf(appId), instanceId);
         return ResultDTO.success(null);
     }
 
     @GetMapping("/detail")
-    public ResultDTO<InstanceDetailVO> getInstanceDetail(Long instanceId) {
-        return ResultDTO.success(InstanceDetailVO.from(instanceService.getInstanceDetail(instanceId)));
+    @ApiPermission(name = "Instance-Detail", roleScope = RoleScope.APP, requiredPermission = Permission.READ)
+    public ResultDTO<InstanceDetailVO> getInstanceDetail(Long appId, Long instanceId) {
+        QueryInstanceDetailRequest queryInstanceDetailRequest = new QueryInstanceDetailRequest();
+        queryInstanceDetailRequest.setAppId(appId);
+        queryInstanceDetailRequest.setInstanceId(instanceId);
+        return getInstanceDetailPlus(queryInstanceDetailRequest);
+    }
+
+    @PostMapping("/detailPlus")
+    public ResultDTO<InstanceDetailVO> getInstanceDetailPlus(@RequestBody QueryInstanceDetailRequest req) {
+
+        // 非法请求参数校验
+        String customQuery = req.getCustomQuery();
+        String nonNullCustomQuery = Optional.ofNullable(customQuery).orElse(OmsConstant.NONE);
+        if (StringUtils.containsAnyIgnoreCase(nonNullCustomQuery, "delete", "update", "insert", "drop", "CREATE", "ALTER", "TRUNCATE", "RENAME", "LOCK", "GRANT", "REVOKE", "PREPARE", "EXECUTE", "COMMIT", "BEGIN")) {
+            throw new IllegalArgumentException("Don't get any ideas about the database, illegally query: " + customQuery);
+        }
+
+        // 兼容老版本前端不存在 appId 的场景
+        if (req.getAppId() == null) {
+            req.setAppId(instanceService.getInstanceInfo(req.getInstanceId()).getAppId());
+        }
+
+        return ResultDTO.success(InstanceDetailVO.from(instanceService.getInstanceDetail(req.getAppId(), req.getInstanceId(), customQuery)));
     }
 
     @GetMapping("/log")
+    @ApiPermission(name = "Instance-Log", roleScope = RoleScope.APP, requiredPermission = Permission.OPS)
     public ResultDTO<StringPage> getInstanceLog(Long appId, Long instanceId, Long index) {
         return ResultDTO.success(instanceLogService.fetchInstanceLog(appId, instanceId, index));
     }
 
     @GetMapping("/downloadLogUrl")
+    @ApiPermission(name = "Instance-FetchDownloadLogUrl", roleScope = RoleScope.APP, requiredPermission = Permission.READ)
     public ResultDTO<String> getDownloadUrl(Long appId, Long instanceId) {
         return ResultDTO.success(instanceLogService.fetchDownloadUrl(appId, instanceId));
     }
@@ -112,6 +139,7 @@ public class InstanceController {
     }
 
     @PostMapping("/list")
+    @ApiPermission(name = "Instance-List", roleScope = RoleScope.APP, requiredPermission = Permission.READ)
     public ResultDTO<PageResult<InstanceInfoVO>> list(@RequestBody QueryInstanceRequest request) {
 
         Sort sort = Sort.by(Sort.Direction.DESC, "gmtModified");

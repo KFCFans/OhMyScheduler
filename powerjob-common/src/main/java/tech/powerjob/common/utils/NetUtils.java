@@ -37,25 +37,50 @@ import static java.util.Collections.emptyList;
 @Slf4j
 public class NetUtils {
 
-    // returned port range is [30000, 39999]
+    /**
+     * returned port range is [30000, 39999]
+     */
     private static final int RND_PORT_START = 30000;
     private static final int RND_PORT_END = 65535;
-    
+
     private static volatile String HOST_ADDRESS;
     private static final String LOCALHOST_VALUE = "127.0.0.1";
     private static volatile InetAddress LOCAL_ADDRESS = null;
     private static final Pattern IP_PATTERN = Pattern.compile("\\d{1,3}(\\.\\d{1,3}){3,5}$");
-    private static final String ANYHOST_VALUE = "0.0.0.0";
+    private static final String ANY_HOST_VALUE = "0.0.0.0";
+
+    private NetUtils() {
+    }
 
     public static int getRandomPort() {
         return ThreadLocalRandom.current().nextInt(RND_PORT_START, RND_PORT_END);
     }
 
     /**
+     * 检测某个 IP 端口是否可用
+     * @param ip IP
+     * @param port 端口
+     * @return 是否可用
+     */
+    public static boolean checkIpPortAvailable(String ip, int port) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(ip, port), 1000);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
      * 获取本机 IP 地址
+     *
      * @return 本机 IP 地址
      */
     public static String getLocalHost() {
+        return getLocalHostWithNetworkInterfaceChecker(null);
+    }
+
+    public static String getLocalHostWithNetworkInterfaceChecker(NetworkInterfaceChecker networkInterfaceChecker) {
         if (HOST_ADDRESS != null) {
             return HOST_ADDRESS;
         }
@@ -66,7 +91,7 @@ public class NetUtils {
             return HOST_ADDRESS = addressFromJVM;
         }
 
-        InetAddress address = getLocalAddress();
+        InetAddress address = getLocalAddress(networkInterfaceChecker);
         if (address != null) {
             return HOST_ADDRESS = address.getHostAddress();
         }
@@ -74,41 +99,39 @@ public class NetUtils {
     }
 
     /**
+     * 隔离调用 scope，核心场景才能直接调用 getLocalHost，方便查看使用点
+     * @return IP
+     */
+    public static String getLocalHost4Test() {
+        return getLocalHost();
+    }
+
+    /**
      * Find first valid IP from local network card
      *
      * @return first valid local IP
      */
-    public static InetAddress getLocalAddress() {
+    public static InetAddress getLocalAddress(NetworkInterfaceChecker networkInterfaceChecker) {
         if (LOCAL_ADDRESS != null) {
             return LOCAL_ADDRESS;
         }
-        InetAddress localAddress = getLocalAddress0();
+        InetAddress localAddress = getLocalAddress0(networkInterfaceChecker);
         LOCAL_ADDRESS = localAddress;
         return localAddress;
     }
-    private static InetAddress getLocalAddress0() {
-        InetAddress localAddress = null;
 
+    private static InetAddress getLocalAddress0(NetworkInterfaceChecker networkInterfaceChecker) {
         // @since 2.7.6, choose the {@link NetworkInterface} first
         try {
-            NetworkInterface networkInterface = findNetworkInterface();
-            Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
-            while (addresses.hasMoreElements()) {
-                Optional<InetAddress> addressOp = toValidAddress(addresses.nextElement());
-                if (addressOp.isPresent()) {
-                    try {
-                        if (addressOp.get().isReachable(100)) {
-                            return addressOp.get();
-                        }
-                    } catch (IOException e) {
-                        // ignore
-                    }
-                }
+            InetAddress addressOp = getFirstReachableInetAddress( findNetworkInterface(networkInterfaceChecker));
+            if (addressOp != null) {
+                return addressOp;
             }
         } catch (Throwable e) {
             log.warn("[Net] getLocalAddress0 failed.", e);
         }
 
+        InetAddress localAddress = null;
         try {
             localAddress = InetAddress.getLocalHost();
             Optional<InetAddress> addressOp = toValidAddress(localAddress);
@@ -123,13 +146,34 @@ public class NetUtils {
         return localAddress;
     }
 
+    private static InetAddress getFirstReachableInetAddress(NetworkInterface networkInterface) {
+
+        if(networkInterface == null ){
+            return null;
+        }
+        Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
+        while (addresses.hasMoreElements()) {
+            Optional<InetAddress> addressOp = toValidAddress(addresses.nextElement());
+            if (addressOp.isPresent()) {
+                try {
+                    if (addressOp.get().isReachable(100)) {
+                        return addressOp.get();
+                    }
+                } catch (IOException e) {
+                    // ignore
+                }
+            }
+        }
+        return null;
+    }
+
     /**
      * Get the suitable {@link NetworkInterface}
      *
      * @return If no {@link NetworkInterface} is available , return <code>null</code>
      * @since 2.7.6
      */
-    public static NetworkInterface findNetworkInterface() {
+    public static NetworkInterface findNetworkInterface(NetworkInterfaceChecker networkInterfaceChecker) {
 
         List<NetworkInterface> validNetworkInterfaces = emptyList();
         try {
@@ -138,41 +182,49 @@ public class NetUtils {
             log.warn("[Net] findNetworkInterface failed", e);
         }
 
-        NetworkInterface result = null;
+        // sort by interface index, the smaller is preferred.
+         validNetworkInterfaces.sort(Comparator.comparingInt(NetworkInterface::getIndex));
 
         // Try to find the preferred one
         for (NetworkInterface networkInterface : validNetworkInterfaces) {
             if (isPreferredNetworkInterface(networkInterface)) {
-                result = networkInterface;
-                log.info("[Net] use preferred network interface: {}", networkInterface.getDisplayName());
-                break;
+                log.info("[Net] use preferred network interface: {}", networkInterface);
+                return networkInterface;
+            }
+            if (isPassedCheckNetworkInterface(networkInterface, networkInterfaceChecker)) {
+                log.info("[Net] use PassedCheckNetworkInterface: {}", networkInterface);
+                return networkInterface;
+            }
+        }
+        // If not found, try to get the first one
+        for (NetworkInterface networkInterface : validNetworkInterfaces) {
+            InetAddress addressOp = getFirstReachableInetAddress(networkInterface);
+            if (addressOp != null) {
+                return networkInterface;
             }
         }
 
-        if (result == null) { // If not found, try to get the first one
-            for (NetworkInterface networkInterface : validNetworkInterfaces) {
-                Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
-                while (addresses.hasMoreElements()) {
-                    Optional<InetAddress> addressOp = toValidAddress(addresses.nextElement());
-                    if (addressOp.isPresent()) {
-                        try {
-                            if (addressOp.get().isReachable(100)) {
-                                result = networkInterface;
-                                break;
-                            }
-                        } catch (IOException e) {
-                            // ignore
-                        }
-                    }
-                }
-            }
-        }
+        return first(validNetworkInterfaces);
+    }
 
-        if (result == null) {
-            result = first(validNetworkInterfaces);
+    /**
+     * 通过用户方法判断是否为目标网卡
+     * @param networkInterface networkInterface
+     * @param networkInterfaceChecker 判断方法
+     * @return true or false
+     */
+    static boolean isPassedCheckNetworkInterface(NetworkInterface networkInterface, NetworkInterfaceChecker networkInterfaceChecker) {
+        if (networkInterfaceChecker == null) {
+            return false;
         }
-
-        return result;
+        try {
+            boolean ok = networkInterfaceChecker.ok(networkInterface, getFirstReachableInetAddress(networkInterface));
+            log.info("[Net] try to choose NetworkInterface by NetworkInterfaceChecker, current NetworkInterface[{}], ok: {}", networkInterface, ok);
+            return ok;
+        } catch (Exception e) {
+            log.warn("[Net] isPassedCheckerNetworkInterface failed, current networkInterface: {}", networkInterface, e);
+        }
+        return false;
     }
 
     private static Optional<InetAddress> toValidAddress(InetAddress address) {
@@ -205,7 +257,7 @@ public class NetUtils {
         String name = address.getHostAddress();
         return (name != null
                 && IP_PATTERN.matcher(name).matches()
-                && !ANYHOST_VALUE.equals(name)
+                && !ANY_HOST_VALUE.equals(name)
                 && !LOCALHOST_VALUE.equals(name));
     }
 
@@ -249,7 +301,8 @@ public class NetUtils {
         Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
         while (interfaces.hasMoreElements()) {
             NetworkInterface networkInterface = interfaces.nextElement();
-            if (ignoreNetworkInterface(networkInterface)) { // ignore
+            // ignore
+            if (ignoreNetworkInterface(networkInterface)) {
                 continue;
             }
             // 根据用户 -D 参数忽略网卡
@@ -326,5 +379,10 @@ public class NetUtils {
             return true;
         }
         return false;
+    }
+
+    @FunctionalInterface
+    public interface NetworkInterfaceChecker {
+        boolean ok(NetworkInterface networkInterface, InetAddress inetAddress);
     }
 }

@@ -11,14 +11,25 @@ import lombok.Data;
 @Data
 public class QueryJobInfoRequest {
 
-    // 任务所属应用ID
+    /**
+     * 任务所属应用ID
+     */
     private Long appId;
-    // 当前页码
+    /**
+     * 任务所属目录
+     */
+    private Long catalogId;
+    /**
+     * 当前页码
+     */
     private Integer index;
-    // 页大小
+    /**
+     * 页大小
+     */
     private Integer pageSize;
-
-    // 查询条件
+    /**
+     * 任务ID
+     */
     private Long jobId;
     private String keyword;
 }

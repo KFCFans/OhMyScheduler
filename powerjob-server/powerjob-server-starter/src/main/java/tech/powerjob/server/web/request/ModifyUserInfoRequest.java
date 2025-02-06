@@ -14,11 +14,18 @@ public class ModifyUserInfoRequest {
     private Long id;
 
     private String username;
+    private String nick;
     private String password;
     private String webHook;
 
-    // 手机号
+    /**
+     * 手机号
+     */
     private String phone;
-    // 邮箱地址
+    /**
+     * 邮箱地址
+     */
     private String email;
+
+    private String extra;
 }

@@ -1,29 +1,37 @@
 package tech.powerjob.server.core;
 
-import tech.powerjob.common.RemoteConstant;
-import tech.powerjob.common.SystemInstanceResult;
-import tech.powerjob.common.enums.*;
-import tech.powerjob.common.request.ServerScheduleJobReq;
-import tech.powerjob.server.core.instance.InstanceManager;
-import tech.powerjob.server.core.instance.InstanceMetadataService;
-import tech.powerjob.server.core.lock.UseSegmentLock;
-import tech.powerjob.server.persistence.remote.model.InstanceInfoDO;
-import tech.powerjob.server.persistence.remote.model.JobInfoDO;
-import tech.powerjob.server.persistence.remote.repository.InstanceInfoRepository;
-import tech.powerjob.server.remote.transport.TransportService;
-import tech.powerjob.server.remote.worker.WorkerClusterQueryService;
-import tech.powerjob.server.common.module.WorkerInfo;
 import com.google.common.collect.Lists;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
-import org.springframework.util.StringUtils;
+import tech.powerjob.common.RemoteConstant;
+import tech.powerjob.common.SystemInstanceResult;
+import tech.powerjob.common.enums.ExecuteType;
+import tech.powerjob.common.enums.InstanceStatus;
+import tech.powerjob.common.enums.ProcessorType;
+import tech.powerjob.common.enums.TimeExpressionType;
+import tech.powerjob.common.request.ServerScheduleJobReq;
+import tech.powerjob.remote.framework.base.URL;
+import tech.powerjob.server.common.Holder;
+import tech.powerjob.server.common.module.WorkerInfo;
+import tech.powerjob.server.core.instance.InstanceManager;
+import tech.powerjob.server.core.instance.InstanceMetadataService;
+import tech.powerjob.server.core.lock.UseCacheLock;
+import tech.powerjob.server.persistence.remote.model.InstanceInfoDO;
+import tech.powerjob.server.persistence.remote.model.JobInfoDO;
+import tech.powerjob.server.persistence.remote.repository.InstanceInfoRepository;
+import tech.powerjob.server.remote.transporter.TransportService;
+import tech.powerjob.server.remote.transporter.impl.ServerURLFactory;
+import tech.powerjob.server.remote.worker.WorkerClusterQueryService;
+import tech.powerjob.server.remote.worker.selector.TaskTrackerSelectorService;
 
-import javax.annotation.Resource;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static tech.powerjob.common.enums.InstanceStatus.*;
@@ -38,35 +46,40 @@ import static tech.powerjob.common.enums.InstanceStatus.*;
  */
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class DispatchService {
 
-    @Resource
-    private TransportService transportService;
-    @Resource
-    private WorkerClusterQueryService workerClusterQueryService;
+    private final TransportService transportService;
 
-    @Resource
-    private InstanceManager instanceManager;
-    @Resource
-    private InstanceMetadataService instanceMetadataService;
-    @Resource
-    private InstanceInfoRepository instanceInfoRepository;
+    private final WorkerClusterQueryService workerClusterQueryService;
+
+    private final InstanceManager instanceManager;
+
+    private final InstanceMetadataService instanceMetadataService;
+
+    private final InstanceInfoRepository instanceInfoRepository;
+
+    private final TaskTrackerSelectorService taskTrackerSelectorService;
 
     /**
-     * 重新派发任务实例（不考虑实例当前的状态）
+     * 异步重新派发
      *
-     * @param jobInfo    任务信息（注意，这里传入的任务信息有可能为“空”）
-     * @param instanceId 实例ID
+     * @param instanceId 实例 ID
      */
-    @UseSegmentLock(type = "redispatch", key = "#jobInfo.getId() ?: 0", concurrencyLevel = 16)
-    public void redispatch(JobInfoDO jobInfo, long instanceId) {
-        InstanceInfoDO instance = instanceInfoRepository.findByInstanceId(instanceId);
+    @UseCacheLock(type = "processJobInstance", key = "#instanceId", concurrencyLevel = 1024)
+    public void redispatchAsync(Long instanceId, int originStatus) {
         // 将状态重置为等待派发
-        instance.setStatus(InstanceStatus.WAITING_DISPATCH.getV());
-        instance.setGmtModified(new Date());
-        instanceInfoRepository.saveAndFlush(instance);
-        dispatch(jobInfo, instanceId);
+        instanceInfoRepository.updateStatusAndGmtModifiedByInstanceIdAndOriginStatus(instanceId, originStatus, InstanceStatus.WAITING_DISPATCH.getV(), new Date());
     }
+
+    /**
+     * 异步批量重新派发，不加锁
+     */
+    public void redispatchBatchAsyncLockFree(List<Long> instanceIdList, int originStatus) {
+        // 将状态重置为等待派发
+        instanceInfoRepository.updateStatusAndGmtModifiedByInstanceIdListAndOriginStatus(instanceIdList, originStatus, InstanceStatus.WAITING_DISPATCH.getV(), new Date());
+    }
+
 
     /**
      * 将任务从Server派发到Worker（TaskTracker）
@@ -79,13 +92,16 @@ public class DispatchService {
      * 迁移至 {@link InstanceManager#updateStatus} 中处理
      * **************************************************
      *
-     * @param jobInfo    任务的元信息
-     * @param instanceId 任务实例ID
+     * @param jobInfo              任务的元信息
+     * @param instanceId           任务实例ID
+     * @param instanceInfoOptional 任务实例信息，可选
+     * @param overloadOptional     超载信息，可选
      */
-    @UseSegmentLock(type = "dispatch", key = "#jobInfo.getId() ?: 0", concurrencyLevel = 1024)
-    public void dispatch(JobInfoDO jobInfo, long instanceId) {
+    @UseCacheLock(type = "processJobInstance", key = "#jobInfo.getMaxInstanceNum() > 0 || T(tech.powerjob.common.enums.TimeExpressionType).FREQUENT_TYPES.contains(#jobInfo.getTimeExpressionType()) ? #jobInfo.getId() : #instanceId", concurrencyLevel = 1024)
+    public void dispatch(JobInfoDO jobInfo, Long instanceId, Optional<InstanceInfoDO> instanceInfoOptional, Optional<Holder<Boolean>> overloadOptional) {
+        // 允许从外部传入实例信息，减少 io 次数
         // 检查当前任务是否被取消
-        InstanceInfoDO instanceInfo = instanceInfoRepository.findByInstanceId(instanceId);
+        InstanceInfoDO instanceInfo = instanceInfoOptional.orElseGet(() -> instanceInfoRepository.findByInstanceId(instanceId));
         Long jobId = instanceInfo.getJobId();
         if (CANCELED.getV() == instanceInfo.getStatus()) {
             log.info("[Dispatcher-{}|{}] cancel dispatch due to instance has been canceled", jobId, instanceId);
@@ -112,7 +128,7 @@ public class DispatchService {
         long current = System.currentTimeMillis();
         Integer maxInstanceNum = jobInfo.getMaxInstanceNum();
         // 秒级任务只派发到一台机器，具体的 maxInstanceNum 由 TaskTracker 控制
-        if (TimeExpressionType.frequentTypes.contains(jobInfo.getTimeExpressionType())) {
+        if (TimeExpressionType.FREQUENT_TYPES.contains(jobInfo.getTimeExpressionType())) {
             maxInstanceNum = 1;
         }
 
@@ -126,14 +142,13 @@ public class DispatchService {
                 String result = String.format(SystemInstanceResult.TOO_MANY_INSTANCES, runningInstanceCount, maxInstanceNum);
                 log.warn("[Dispatcher-{}|{}] cancel dispatch job due to too much instance is running ({} > {}).", jobId, instanceId, runningInstanceCount, maxInstanceNum);
                 instanceInfoRepository.update4TriggerFailed(instanceId, FAILED.getV(), current, current, RemoteConstant.EMPTY_ADDRESS, result, now);
-
                 instanceManager.processFinishedInstance(instanceId, instanceInfo.getWfInstanceId(), FAILED, result);
                 return;
             }
         }
 
         // 获取当前最合适的 worker 列表
-        List<WorkerInfo> suitableWorkers = workerClusterQueryService.getSuitableWorkers(jobInfo);
+        List<WorkerInfo> suitableWorkers = workerClusterQueryService.geAvailableWorkers(jobInfo);
 
         if (CollectionUtils.isEmpty(suitableWorkers)) {
             log.warn("[Dispatcher-{}|{}] cancel dispatch job due to no worker available", jobId, instanceId);
@@ -142,24 +157,42 @@ public class DispatchService {
             instanceManager.processFinishedInstance(instanceId, instanceInfo.getWfInstanceId(), FAILED, SystemInstanceResult.NO_WORKER_AVAILABLE);
             return;
         }
+        // 判断是否超载，在所有可用 worker 超载的情况下直接跳过当前任务
+        suitableWorkers = filterOverloadWorker(suitableWorkers);
+        if (suitableWorkers.isEmpty()) {
+            // 直接取消派发，减少一次数据库 io
+            overloadOptional.ifPresent(booleanHolder -> booleanHolder.set(true));
+            log.warn("[Dispatcher-{}|{}] cancel to dispatch job due to all worker is overload", jobId, instanceId);
+            return;
+        }
         List<String> workerIpList = suitableWorkers.stream().map(WorkerInfo::getAddress).collect(Collectors.toList());
-
         // 构造任务调度请求
         ServerScheduleJobReq req = constructServerScheduleJobReq(jobInfo, instanceInfo, workerIpList);
 
-
         // 发送请求（不可靠，需要一个后台线程定期轮询状态）
-        WorkerInfo taskTracker = selectTaskTracker(jobInfo, suitableWorkers);
+        WorkerInfo taskTracker = taskTrackerSelectorService.select(jobInfo, instanceInfo, suitableWorkers);
         String taskTrackerAddress = taskTracker.getAddress();
 
-        transportService.tell(Protocol.of(taskTracker.getProtocol()), taskTrackerAddress, req);
+        URL workerUrl = ServerURLFactory.dispatchJob2Worker(taskTrackerAddress);
+        transportService.tell(taskTracker.getProtocol(), workerUrl, req);
         log.info("[Dispatcher-{}|{}] send schedule request to TaskTracker[protocol:{},address:{}] successfully: {}.", jobId, instanceId, taskTracker.getProtocol(), taskTrackerAddress, req);
 
         // 修改状态
-        instanceInfoRepository.update4TriggerSucceed(instanceId, WAITING_WORKER_RECEIVE.getV(), current, taskTrackerAddress, now);
-
+        instanceInfoRepository.update4TriggerSucceed(instanceId, WAITING_WORKER_RECEIVE.getV(), current, taskTrackerAddress, now, instanceInfo.getStatus());
         // 装载缓存
         instanceMetadataService.loadJobInfo(instanceId, jobInfo);
+    }
+
+    private List<WorkerInfo> filterOverloadWorker(List<WorkerInfo> suitableWorkers) {
+
+        List<WorkerInfo> res = new ArrayList<>(suitableWorkers.size());
+        for (WorkerInfo suitableWorker : suitableWorkers) {
+            if (suitableWorker.overload()){
+                continue;
+            }
+            res.add(suitableWorker);
+        }
+        return res;
     }
 
     /**
@@ -183,6 +216,7 @@ public class DispatchService {
         }
         req.setInstanceId(instanceInfo.getInstanceId());
         req.setAllWorkerAddress(finalWorkersIpList);
+        req.setMaxWorkerCount(jobInfo.getMaxWorkerCount());
 
         // 设置工作流ID
         req.setWfInstanceId(instanceInfo.getWfInstanceId());
@@ -196,18 +230,5 @@ public class DispatchService {
         }
         req.setThreadConcurrency(jobInfo.getConcurrency());
         return req;
-    }
-
-    private WorkerInfo selectTaskTracker(JobInfoDO jobInfo, List<WorkerInfo> workerInfos) {
-        DispatchStrategy dispatchStrategy = DispatchStrategy.of(jobInfo.getDispatchStrategy());
-        switch (dispatchStrategy) {
-            case HEALTH_FIRST:
-                return workerInfos.get(0);
-            case RANDOM:
-                return workerInfos.get(ThreadLocalRandom.current().nextInt(workerInfos.size()));
-            default:
-        }
-        // impossible, indian java
-        return workerInfos.get(0);
     }
 }
